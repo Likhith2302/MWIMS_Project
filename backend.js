@@ -49,10 +49,6 @@ const io = socketIo(server, {
     }
 });
 
-// --- REMOVED: Serial Port Setup for Arduino DHT11 Sensor ---
-// (This section was removed as per request for codes before DHT11 integration)
-
-
 // --- Helper Function: Smart Allocation Logic ---
 async function findSuitableLocation(connection, productId, quantityNeeded) {
     try {
@@ -78,10 +74,7 @@ async function findSuitableLocation(connection, productId, quantityNeeded) {
         let suitableLocation = null;
 
         if (productCategory === 'Cold Storage') {
-            // For Cold Storage, also check temperature (simplified check as no real-time data)
-            // It will still rely on 'latest_temperature' in DB which might be set manually or via API
             for (const loc of candidateLocations) {
-                // If latest_temperature is within bounds OR is null (no reading, assume OK for allocation)
                 if (loc.latest_temperature === null || (loc.latest_temperature >= loc.min_temp && loc.latest_temperature <= loc.max_temp)) {
                     suitableLocation = loc;
                     console.log(`Smart Allocation: Found Cold Storage location ${loc.location_id} with suitable temperature (or no data yet).`);
@@ -91,7 +84,6 @@ async function findSuitableLocation(connection, productId, quantityNeeded) {
                 }
             }
         } else {
-            // For Ambient storage, just pick the first available candidate (which has the most free space)
             if (candidateLocations.length > 0) {
                 suitableLocation = candidateLocations[0];
                 console.log(`Smart Allocation: Found Ambient location ${suitableLocation.location_id}.`);
@@ -156,7 +148,6 @@ app.get('/storage_locations', async (req, res, next) => {
     try {
         const [locations] = await pool.query('SELECT * FROM storage_locations');
 
-        // Fetch all batches that are assigned to *any* location, along with product details
         const [batchesWithProductInfo] = await pool.query(`
             SELECT
                 b.batch_id,
@@ -179,17 +170,14 @@ app.get('/storage_locations', async (req, res, next) => {
                 b.assigned_location_id IS NOT NULL;
         `);
 
-        // Map batches and latest temperature to their respective locations
         const locationsWithDetails = await Promise.all(locations.map(async (location) => {
             const contents = batchesWithProductInfo.filter(batch => batch.assigned_location_id === location.location_id);
 
-            // Latest temperature and update time are now part of the storage_locations table itself
             if (location.last_temp_update) {
                 location.last_temp_update_formatted = new Date(location.last_temp_update).toLocaleString();
             } else {
                 location.last_temp_update_formatted = 'N/A';
             }
-
 
             return {
                 ...location,
@@ -204,7 +192,6 @@ app.get('/storage_locations', async (req, res, next) => {
         next(err);
     }
 });
-
 // Storage Locations: Add new (from UI)
 app.post('/storage_locations', async (req, res, next) => {
     let { zone, rack, slot, location_type, size_type, capacity, min_temp, max_temp } = req.body;
@@ -230,7 +217,7 @@ app.post('/storage_locations', async (req, res, next) => {
     try {
         const [result] = await pool.query(
             `INSERT INTO storage_locations (zone, rack, slot, location_type, size_type, capacity, current_occupancy, min_temp, max_temp)
-             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`, // current_occupancy always starts at 0
+             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
             [zone, rack, slot, location_type, size_type || null, capacity, min_temp, max_temp]
         );
         const [newLocation] = await pool.query('SELECT * FROM storage_locations WHERE location_id = ?', [result.insertId]);
@@ -249,7 +236,6 @@ app.post('/storage_locations', async (req, res, next) => {
 // Batches: Get all (for Dashboard display)
 app.get('/batches', async (req, res, next) => {
     try {
-        // Fetch batches along with product details and assigned location info
         const [rows] = await pool.query(`
             SELECT
                 b.batch_id,
@@ -264,7 +250,7 @@ app.get('/batches', async (req, res, next) => {
                 b.barcode,
                 b.assigned_location_id,
                 b.status,
-                sl.zone, sl.rack, sl.slot -- Include location details for dashboard
+                sl.zone, sl.rack, sl.slot
             FROM batches b
             JOIN products p ON b.product_id = p.product_id
             LEFT JOIN storage_locations sl ON b.assigned_location_id = sl.location_id
@@ -280,58 +266,55 @@ app.get('/batches', async (req, res, next) => {
 // Batches: Add new (with integrated smart allocation)
 app.post('/batches', async (req, res, next) => {
     const { product_id, batch_number, manufacture_date, expiry_date, quantity, barcode } = req.body;
-    // storageLocationId is implicitly undefined now from frontend, which triggers smart allocation
 
     if (!product_id || !batch_number || !expiry_date || quantity === undefined || isNaN(quantity) || quantity <= 0) {
         return res.status(400).json({ error: 'Missing required batch fields (product, batch number, expiry date, or valid quantity).' });
     }
 
-    const connection = await pool.getConnection(); // Get a connection from the pool for transactions
+    const connection = await pool.getConnection();
     try {
-        await connection.beginTransaction(); // Start a transaction
+        await connection.beginTransaction();
 
         const suitableLocation = await findSuitableLocation(connection, product_id, quantity);
         if (!suitableLocation) {
             await connection.rollback();
-            return res.status(400).json({ error: 'No suitable storage location found based on product criteria, capacity, and temperature. Please ensure you have available racks and, for Cold Storage, valid temperature readings.' });
+            return res.status(400).json({ error: 'No suitable storage location found based on product criteria, capacity, and temperature.' });
         }
         const assignedLocationId = suitableLocation.location_id;
         console.log(`Batch ${batch_number} smart allocated to location ID: ${assignedLocationId}`);
 
-        // Insert new batch
         const [batchResult] = await connection.query(
             'INSERT INTO batches (product_id, batch_number, manufacture_date, expiry_date, quantity, barcode, assigned_location_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [product_id, batch_number, manufacture_date || null, expiry_date, quantity, barcode || batch_number, assignedLocationId, 'Available']
         );
         const newBatchId = batchResult.insertId;
 
-        // Update current occupancy of the assigned location
         await connection.query(
             'UPDATE storage_locations SET current_occupancy = current_occupancy + ? WHERE location_id = ?',
             [quantity, assignedLocationId]
         );
 
-        await connection.commit(); // Commit the transaction
+        await connection.commit();
         res.status(201).json({
             message: 'Stock added successfully!',
-            batch: { batch_id: newBatchId, barcode: barcode || batch_number }, // Return actual barcode used
+            batch: { batch_id: newBatchId, barcode: barcode || batch_number },
             assigned_location_id: assignedLocationId
         });
 
     }
     catch (err) {
-        await connection.rollback(); // Rollback on error
+        await connection.rollback();
         if (err.code === 'ER_DUP_ENTRY' && err.message.includes('batches.batch_number')) {
-            return res.status(409).json({ error: `Batch number '${batch_number}' already exists. Please use a unique batch number.` });
+            return res.status(409).json({ error: `Batch number '${batch_number}' already exists.` });
         }
         console.error('Error adding stock (backend):', err);
-        next(err); // Pass to generic error handler
+        next(err);
     } finally {
-        connection.release(); // Release the connection
+        connection.release();
     }
 });
 
-// Batches: Update (e.g., quantity, expiry_date)
+// Batches: Update
 app.put('/batches/:id', async (req, res, next) => {
     const { id } = req.params;
     const { product_id, batch_number, manufacture_date, expiry_date, quantity, barcode, status } = req.body;
@@ -344,7 +327,6 @@ app.put('/batches/:id', async (req, res, next) => {
     try {
         await connection.beginTransaction();
 
-        // Get old quantity and assigned_location_id to correctly adjust occupancy
         const [oldBatchRows] = await connection.query(
             'SELECT quantity, assigned_location_id FROM batches WHERE batch_id = ? FOR UPDATE',
             [id]
@@ -356,16 +338,14 @@ app.put('/batches/:id', async (req, res, next) => {
         const oldQuantity = oldBatchRows[0].quantity;
         const assignedLocationId = oldBatchRows[0].assigned_location_id;
 
-        // Update the batch itself
-        const [result] = await connection.query(
+        await connection.query(
             `UPDATE batches SET product_id = ?, batch_number = ?, manufacture_date = ?, expiry_date = ?, quantity = ?, barcode = ?, status = ?
              WHERE batch_id = ?`,
             [product_id, batch_number, manufacture_date || null, expiry_date, quantity, barcode || batch_number, status, id]
         );
 
-        // Adjust storage location occupancy if assigned
         if (assignedLocationId) {
-            const quantityDifference = quantity - oldQuantity; // Positive for increase, negative for decrease
+            const quantityDifference = quantity - oldQuantity;
             await connection.query(
                 'UPDATE storage_locations SET current_occupancy = current_occupancy + ? WHERE location_id = ?',
                 [quantityDifference, assignedLocationId]
@@ -388,14 +368,13 @@ app.put('/batches/:id', async (req, res, next) => {
     }
 });
 
-// Batches: Delete (includes occupancy adjustment)
+// Batches: Delete
 app.delete('/batches/:id', async (req, res, next) => {
     const { id } = req.params;
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
 
-        // Get batch quantity and assigned location ID before deleting
         const [batchRows] = await connection.query(
             'SELECT quantity, assigned_location_id FROM batches WHERE batch_id = ? FOR UPDATE',
             [id]
@@ -408,18 +387,13 @@ app.delete('/batches/:id', async (req, res, next) => {
         const batchQuantity = batchRows[0].quantity;
         const assignedLocationId = batchRows[0].assigned_location_id;
 
-        // Delete any pending picks related to this batch first to avoid foreign key constraint issues
         await connection.query('DELETE FROM order_batch_picks WHERE batch_id = ?', [id]);
 
-
-        // Delete the batch
         const [result] = await connection.query('DELETE FROM batches WHERE batch_id = ?', [id]);
-
         if (result.affectedRows === 0) {
             throw new Error('Batch not found or no changes made.');
         }
 
-        // Decrement current_occupancy if it was assigned to a location
         if (assignedLocationId) {
             await connection.query(
                 'UPDATE storage_locations SET current_occupancy = current_occupancy - ? WHERE location_id = ?',
@@ -438,8 +412,6 @@ app.delete('/batches/:id', async (req, res, next) => {
         connection.release();
     }
 });
-
-
 // Orders: Get all (with nested items and picked batches)
 app.get('/orders', async (req, res, next) => {
     try {
@@ -458,7 +430,7 @@ app.get('/orders', async (req, res, next) => {
             const [pickedBatches] = await pool.query(
                 `SELECT obp.pick_id, obp.batch_id, obp.quantity_picked, obp.status,
                         b.batch_number, b.barcode, p.name AS product_name, b.assigned_location_id,
-                        sl.zone, sl.rack, sl.slot, sl.size_type -- Include location details
+                        sl.zone, sl.rack, sl.slot, sl.size_type
                  FROM order_batch_picks obp
                  JOIN batches b ON obp.batch_id = b.batch_id
                  JOIN products p ON b.product_id = p.product_id
@@ -480,7 +452,7 @@ app.get('/orders', async (req, res, next) => {
 
 // Orders: Create new (handles stock reduction and pick assignment)
 app.post('/orders', async (req, res, next) => {
-    const { items } = req.body; // items: [{product_id, quantity}]
+    const { items } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
         return res.status(400).json({ error: 'Order must contain at least one item.' });
@@ -502,19 +474,17 @@ app.post('/orders', async (req, res, next) => {
                 throw new Error('Invalid product or quantity in order item.');
             }
 
-            // Insert into order_items table (record what was requested for the order)
             await connection.query(
                 'INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)',
                 [orderId, product_id, quantity]
             );
 
-            // Find suitable batches (FEFO: First Expired, First Out)
             const [availableBatches] = await connection.query(
                 `SELECT batch_id, quantity, assigned_location_id, expiry_date
                  FROM batches
                  WHERE product_id = ? AND quantity > 0 AND status = 'Available'
                  ORDER BY expiry_date ASC
-                 FOR UPDATE`, // Lock batches for update to prevent race conditions
+                 FOR UPDATE`,
                 [product_id]
             );
 
@@ -524,19 +494,16 @@ app.post('/orders', async (req, res, next) => {
 
                 const quantityFromBatch = Math.min(remainingToPick, batch.quantity);
 
-                // Insert into order_batch_picks (linking order item to specific batch used)
                 await connection.query(
                     'INSERT INTO order_batch_picks (order_id, batch_id, quantity_picked, status) VALUES (?, ?, ?, ?)',
                     [orderId, batch.batch_id, quantityFromBatch, 'Pending Pick']
                 );
 
-                // Reduce batch quantity
                 await connection.query(
                     'UPDATE batches SET quantity = quantity - ? WHERE batch_id = ?',
                     [quantityFromBatch, batch.batch_id]
                 );
 
-                // Reduce current_occupancy of the assigned storage location
                 if (batch.assigned_location_id) {
                     await connection.query(
                         'UPDATE storage_locations SET current_occupancy = current_occupancy - ? WHERE location_id = ?',
@@ -548,7 +515,6 @@ app.post('/orders', async (req, res, next) => {
             }
 
             if (remainingToPick > 0) {
-                // Not enough stock to fulfill the order item
                 throw new Error(`Insufficient stock for product ID ${product_id}. Needed ${quantity}, but only ${quantity - remainingToPick} available.`);
             }
         }
@@ -592,8 +558,7 @@ app.put('/orders/:orderId', async (req, res, next) => {
     }
 });
 
-
-// Order Batch Picks: Update status (e.g., mark as 'Picked')
+// Order Batch Picks: Update status
 app.put('/order_batch_picks/:pickId', async (req, res, next) => {
     const { pickId } = req.params;
     const { status } = req.body;
@@ -619,7 +584,6 @@ app.put('/order_batch_picks/:pickId', async (req, res, next) => {
     }
 });
 
-
 // Dispatches: Create record
 app.post('/dispatches', async (req, res, next) => {
     const { order_id, dispatched_by, dispatch_date } = req.body;
@@ -639,7 +603,6 @@ app.post('/dispatches', async (req, res, next) => {
         next(err);
     }
 });
-
 // Barcode Verification Endpoint
 app.get('/verify-barcode/:barcode', async (req, res, next) => {
     const { barcode } = req.params;
@@ -714,7 +677,7 @@ app.get('/verify-barcode/:barcode', async (req, res, next) => {
 });
 
 
-// Temperature Logging Endpoint (receives from simulated input only, no Arduino serial directly)
+// Temperature Logging Endpoint
 app.post('/temperature_logs', async (req, res, next) => {
     const { location_id, temperature_reading } = req.body;
     if (location_id === undefined || temperature_reading === undefined || isNaN(temperature_reading)) {
@@ -725,13 +688,11 @@ app.post('/temperature_logs', async (req, res, next) => {
     try {
         await connection.beginTransaction();
 
-        // 1. Insert into temperature_logs for historical record
         await connection.query(
             'INSERT INTO temperature_logs (location_id, temperature_reading, timestamp) VALUES (?, ?, NOW())',
             [location_id, temperature_reading]
         );
 
-        // 2. Update latest_temperature and last_temp_update on storage_locations table
         await connection.query(
             'UPDATE storage_locations SET latest_temperature = ?, last_temp_update = NOW() WHERE location_id = ?',
             [temperature_reading, location_id]
@@ -740,7 +701,6 @@ app.post('/temperature_logs', async (req, res, next) => {
         await connection.commit();
         res.status(201).json({ message: 'Temperature log received and stored successfully' });
 
-        // Emit update via Socket.IO for real-time frontend refresh
         io.emit('temperatureUpdate', {
             location_id: location_id,
             temperature: temperature_reading,
@@ -830,7 +790,7 @@ app.get('/alerts/temperature', async (req, res, next) => {
                     OR sl.latest_temperature < sl.min_temp
                     OR sl.latest_temperature > sl.max_temp
                     OR sl.last_temp_update IS NULL
-                    OR sl.last_temp_update < DATE_SUB(NOW(), INTERVAL 1 HOUR) -- Alert if no reading in last hour
+                    OR sl.last_temp_update < DATE_SUB(NOW(), INTERVAL 1 HOUR)
                 )
         `);
 
@@ -873,11 +833,7 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         console.log('A frontend client disconnected via Socket.IO:', socket.id);
     });
-
-    // Removed: specific socket.on('temperatureUpdate') logic that was directly from Arduino
-    // The temperature_logs API still emits 'temperatureUpdate' when manually logged.
 });
-
 
 // --- Global Error Handling ---
 app.use((req, res, next) => {
