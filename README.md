@@ -1,4 +1,6 @@
-🏥 Medical Warehouse Inventory System
+**🏥 Medical Warehouse Inventory System**
+
+
 📋 Overview
 This project implements a Medical Warehouse Inventory System that monitors environmental conditions using an Arduino/ESP32 with a DHT11 temperature 🌡️ and humidity 💧 sensor. The sensor data is streamed to a backend server for processing, storage, and visualization. The system helps maintain safe storage conditions by tracking temperature and humidity continuously.
 
